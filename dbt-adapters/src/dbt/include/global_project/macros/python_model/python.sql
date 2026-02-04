@@ -55,6 +55,18 @@ def source(*args, dbt_load_df_function):
         {%- set value = model.config.get(key, default) -%}
         {%- do config_dict.update({key: value}) -%}
     {%- endfor -%}
+    {# Handle dbt.meta_get() calls #}
+    {%- if model.config.meta_keys_used -%}
+        {% set meta_dbt_used = zip(model.config.meta_keys_used, model.config.meta_keys_defaults) | list %}
+        {%- for key, default in meta_dbt_used -%}
+            {%- if model.config.meta and key in model.config.meta -%}
+                {%- set value = model.config.meta[key] -%}
+            {%- else -%}
+                {%- set value = default -%}
+            {%- endif -%}
+            {%- do config_dict.update({key: value}) -%}
+        {%- endfor -%}
+    {%- endif -%}
 config_dict = {{ config_dict }}
 {% endmacro %}
 
@@ -93,6 +105,7 @@ class dbtObj:
         self.config = config
         self.this = this()
         self.is_incremental = {{ is_incremental() }}
+        self.meta_get = lambda key, default=None: config_dict.get(key, default)
 
 # COMMAND ----------
 {{py_script_comment()}}
