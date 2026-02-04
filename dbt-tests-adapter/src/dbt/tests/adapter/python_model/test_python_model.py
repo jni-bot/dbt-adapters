@@ -241,10 +241,10 @@ class BasePythonMetaGetTests:
         )
 
         # Check that meta values were correctly accessed
-        assert result[0] == 'data-team'  # owner from meta
-        assert result[1] == 'high'  # priority from meta
-        assert result[2] == '2'  # version from meta (converted to string)
-        assert result[3] == 'default-value'  # missing key returned default
+        assert result[0] == "data-team"  # owner from meta
+        assert result[1] == "high"  # priority from meta
+        assert result[2] == "2"  # version from meta (converted to string)
+        assert result[3] == "default-value"  # missing key returned default
 
     def test_meta_get_from_schema(self, project):
         """Test that dbt.meta_get() works with meta defined in schema.yml"""
@@ -261,8 +261,10 @@ class BasePythonMetaGetTests:
         )
 
         # Check that meta values from schema.yml were correctly accessed
-        assert result[0] == 'yaml-owner'  # owner from schema.yml
-        assert result[1] == 'production'  # environment from schema.yml
+        assert result[0] == "yaml-owner"  # owner from schema.yml
+        assert result[1] == "production"  # environment from schema.yml
+
+
 class _BaseSkipRefFiltering:
     @pytest.fixture(scope="class")
     def model_that_refs_input_py(self) -> str:
