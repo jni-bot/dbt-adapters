@@ -11,6 +11,8 @@
     {%- set columns = '(' ~ table_dest_columns_csv ~ ')' -%}
     {%- endif -%}
 
+    {%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
+
     {{ sql_header if sql_header is not none }}
 
     create or replace table {{ relation }}
@@ -26,6 +28,7 @@
     {{ partition_by(partition_config) }}
     {{ cluster_by(raw_cluster_by) }}
 
+    {% if catalog_relation.table_format == 'iceberg' and not temporary %}with connection default{% endif %}
     {{ bigquery_table_options(config, model, temporary) }}
 
     {#-- PARTITION BY cannot be used with the AS query_statement clause.
@@ -50,7 +53,13 @@
     {%- if (old_relation.is_table and (should_full_refresh())) -%}
       {% do adapter.drop_relation(relation) %}
     {%- endif -%}
-    {{ py_write_table(compiled_code=compiled_code, target_relation=relation.quote(database=False, schema=False, identifier=False)) }}
+    {%- set submission_method = config.get("submission_method", "serverless") -%}
+    {%- if submission_method in ("serverless", "cluster") -%}
+      {{ py_write_table(compiled_code=compiled_code, target_relation=relation.quote(database=False, schema=False, identifier=False)) }}
+    {%- elif submission_method == "bigframes" -%}
+      {{ bigframes_write_table(compiled_code=compiled_code, target_relation=relation.quote(database=False, schema=False, identifier=False)) }}
+    {%- else -%}
+      {% do exceptions.raise_compiler_error("bigquery__create_table_as macro didn't get supported dataframe syntax, it got %s" % submission_method) %} {%- endif -%}
   {%- else -%}
     {% do exceptions.raise_compiler_error("bigquery__create_table_as macro didn't get supported language, it got %s" % language) %}
   {%- endif -%}
@@ -95,11 +104,25 @@
   {{ return(adapter.check_schema_exists(information_schema.database, schema)) }}
 {% endmacro %}
 
-{#-- relation-level macro is not implemented. This is handled in the CTAs statement #}
+{#-- Handle both relation and column level documentation #}
 {% macro bigquery__persist_docs(relation, model, for_relation, for_columns) -%}
+  {% if for_relation and config.persist_relation_docs() and model.description %}
+    {% do alter_relation_comment(relation, model.description) %}
+  {% endif %}
   {% if for_columns and config.persist_column_docs() and model.columns %}
     {% do alter_column_comment(relation, model.columns) %}
   {% endif %}
+{% endmacro %}
+
+{% macro bigquery__alter_relation_comment(relation, relation_comment) -%}
+  {%- if adapter.behavior.bigquery_noop_alter_relation_comment.no_warn -%}
+    {#-
+      No-op to avoid unnecessary update calls when relation descriptions are already set
+      in DDL (e.g. OPTIONS(description=...)).
+    -#}
+  {%- else -%}
+    {% do adapter.update_table_description(relation.database, relation.schema, relation.identifier, relation_comment) %}
+  {%- endif -%}
 {% endmacro %}
 
 {% macro bigquery__alter_column_comment(relation, column_dict) -%}
@@ -135,6 +158,11 @@
 
   {{ return(run_query(sql)) }}
 
+{% endmacro %}
+
+
+{% macro bigquery__alter_relation_add_remove_columns(relation, add_columns, remove_columns) %}
+  {% do adapter.alter_table_add_remove_columns(relation, add_columns, remove_columns) %}
 {% endmacro %}
 
 
@@ -192,4 +220,35 @@ having count(*) > 1
 
   {% do adapter.upload_file(local_file_path, database, table_schema, table_name, kwargs=kwargs) %}
 
+{% endmacro %}
+
+{% macro bigquery__make_relation_with_suffix(base_relation, suffix, dstring) %}
+    {% if dstring %}
+      {% set dt = modules.datetime.datetime.now() %}
+      {% set dtstring = dt.strftime("%H%M%S%f") %}
+      {% set suffix = suffix ~ dtstring %}
+    {% endif %}
+    {% set suffix_length = suffix|length %}
+    {% set relation_max_name_length = 1024 %}  {# BigQuery limit #}
+    {% if suffix_length > relation_max_name_length %}
+        {% do exceptions.raise_compiler_error('Relation suffix is too long (' ~ suffix_length ~ ' characters). Maximum length is ' ~ relation_max_name_length ~ ' characters.') %}
+    {% endif %}
+    {% set identifier = base_relation.identifier[:relation_max_name_length - suffix_length] ~ suffix %}
+
+    {{ return(base_relation.incorporate(path={"identifier": identifier })) }}
+
+{% endmacro %}
+
+{% macro bigquery__make_temp_relation(base_relation, suffix) %}
+    {% set temp_relation = bigquery__make_relation_with_suffix(base_relation, suffix, dstring=True) %}
+    {{ return(temp_relation) }}
+{% endmacro %}
+
+{% macro bigquery__make_intermediate_relation(base_relation, suffix) %}
+    {{ return(bigquery__make_relation_with_suffix(base_relation, suffix, dstring=False)) }}
+{% endmacro %}
+
+{% macro bigquery__make_backup_relation(base_relation, backup_relation_type, suffix) %}
+    {% set backup_relation = bigquery__make_relation_with_suffix(base_relation, suffix, dstring=False) %}
+    {{ return(backup_relation.incorporate(type=backup_relation_type)) }}
 {% endmacro %}

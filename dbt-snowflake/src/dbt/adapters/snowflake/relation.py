@@ -1,10 +1,9 @@
 import textwrap
-
 from dataclasses import dataclass, field
 from typing import FrozenSet, Optional, Type, Iterator, Tuple
 
 
-from dbt.adapters.base.relation import BaseRelation
+from dbt.adapters.base.relation import BaseRelation, EventTimeFilter
 from dbt.adapters.contracts.relation import ComponentName, RelationConfig
 from dbt.adapters.events.types import AdapterEventWarning, AdapterEventDebug
 from dbt.adapters.relation_configs import (
@@ -16,15 +15,16 @@ from dbt.adapters.utils import classproperty
 from dbt_common.exceptions import DbtRuntimeError
 from dbt_common.events.functions import fire_event, warn_or_error
 
+from dbt.adapters.snowflake import constants
 from dbt.adapters.snowflake.relation_configs import (
     RefreshMode,
-    SnowflakeCatalogConfigChange,
     SnowflakeDynamicTableConfig,
     SnowflakeDynamicTableConfigChangeset,
+    SnowflakeDynamicTableInitializationWarehouseConfigChange,
     SnowflakeDynamicTableRefreshModeConfigChange,
     SnowflakeDynamicTableTargetLagConfigChange,
     SnowflakeDynamicTableWarehouseConfigChange,
-    TableFormat,
+    SnowflakeDynamicTableImmutableWhereConfigChange,
     SnowflakeQuotePolicy,
     SnowflakeRelationType,
 )
@@ -33,7 +33,7 @@ from dbt.adapters.snowflake.relation_configs import (
 @dataclass(frozen=True, eq=False, repr=False)
 class SnowflakeRelation(BaseRelation):
     type: Optional[SnowflakeRelationType] = None
-    table_format: str = TableFormat.DEFAULT
+    table_format: str = constants.INFO_SCHEMA_TABLE_FORMAT
     quote_policy: SnowflakeQuotePolicy = field(default_factory=lambda: SnowflakeQuotePolicy())
     require_alias: bool = False
     relation_configs = {
@@ -44,6 +44,7 @@ class SnowflakeRelation(BaseRelation):
             {
                 SnowflakeRelationType.Table,  # type: ignore
                 SnowflakeRelationType.View,  # type: ignore
+                SnowflakeRelationType.DynamicTable,  # type: ignore
             }
         )
     )
@@ -63,8 +64,12 @@ class SnowflakeRelation(BaseRelation):
         return self.type == SnowflakeRelationType.DynamicTable
 
     @property
+    def is_materialized_view(self) -> bool:
+        return self.type == SnowflakeRelationType.DynamicTable
+
+    @property
     def is_iceberg_format(self) -> bool:
-        return self.table_format == TableFormat.ICEBERG
+        return self.table_format == constants.ICEBERG_TABLE_FORMAT
 
     @classproperty
     def DynamicTable(cls) -> str:
@@ -111,6 +116,17 @@ class SnowflakeRelation(BaseRelation):
             )
 
         if (
+            new_dynamic_table.snowflake_initialization_warehouse
+            != existing_dynamic_table.snowflake_initialization_warehouse
+        ):
+            config_change_collection.snowflake_initialization_warehouse = (
+                SnowflakeDynamicTableInitializationWarehouseConfigChange(
+                    action=RelationConfigChangeAction.alter,  # type:ignore
+                    context=new_dynamic_table.snowflake_initialization_warehouse,
+                )
+            )
+
+        if (
             new_dynamic_table.refresh_mode != RefreshMode.AUTO
             and new_dynamic_table.refresh_mode != existing_dynamic_table.refresh_mode
         ):
@@ -119,10 +135,12 @@ class SnowflakeRelation(BaseRelation):
                 context=new_dynamic_table.refresh_mode,
             )
 
-        if new_dynamic_table.catalog != existing_dynamic_table.catalog:
-            config_change_collection.catalog = SnowflakeCatalogConfigChange(
-                action=RelationConfigChangeAction.create,  # type:ignore
-                context=new_dynamic_table.catalog,
+        if new_dynamic_table.immutable_where != existing_dynamic_table.immutable_where:
+            config_change_collection.immutable_where = (
+                SnowflakeDynamicTableImmutableWhereConfigChange(
+                    action=RelationConfigChangeAction.alter,  # type:ignore
+                    context=new_dynamic_table.immutable_where,
+                )
             )
 
         if config_change_collection.has_changes:
@@ -155,11 +173,9 @@ class SnowflakeRelation(BaseRelation):
         """
         This macro renders the appropriate DDL prefix during the create_table_as
         macro. It decides based on mutually exclusive table configuration options:
-
         - TEMPORARY: Indicates a table that exists only for the duration of the session.
         - ICEBERG: A specific storage format that requires a distinct DDL layout.
         - TRANSIENT: A table similar to a permanent table but without fail-safe.
-
         Additional Caveats for Iceberg models:
         - transient=true throws a warning because Iceberg does not support transient tables
         - A temporary relation is never an Iceberg relation because Iceberg does not
@@ -203,6 +219,22 @@ class SnowflakeRelation(BaseRelation):
         else:
             return ""
 
+    def _render_event_time_filtered(self, event_time_filter: EventTimeFilter) -> str:
+        """
+        Returns "" if start and end are both None
+        """
+        filter = ""
+        if event_time_filter.start and event_time_filter.end:
+            filter = f"{event_time_filter.field_name} >= to_timestamp_tz('{event_time_filter.start}') and {event_time_filter.field_name} < to_timestamp_tz('{event_time_filter.end}')"
+        elif event_time_filter.start:
+            filter = (
+                f"{event_time_filter.field_name} >= to_timestamp_tz('{event_time_filter.start}')"
+            )
+        elif event_time_filter.end:
+            filter = f"{event_time_filter.field_name} < to_timestamp_tz('{event_time_filter.end}')"
+
+        return filter
+
     def get_iceberg_ddl_options(self, config: RelationConfig) -> str:
         # If the base_location_root config is supplied, overwrite the default value ("_dbt/")
         base_location: str = (
@@ -214,10 +246,11 @@ class SnowflakeRelation(BaseRelation):
 
         external_volume = config.get("external_volume")  # type:ignore
         iceberg_ddl_predicates: str = f"""
-        external_volume = '{external_volume}'
         catalog = 'snowflake'
         base_location = '{base_location}'
         """
+        if external_volume := config.get("external_volume"):  # type:ignore
+            iceberg_ddl_predicates += f"\nexternal_volume = '{external_volume}'"
         return textwrap.indent(textwrap.dedent(iceberg_ddl_predicates), " " * 10)
 
     def __drop_conditions(self, old_relation: "SnowflakeRelation") -> Iterator[Tuple[bool, str]]:
